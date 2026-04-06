@@ -1,0 +1,34 @@
+# Copy this file to terraform.tfvars and fill in real values.
+# NEVER commit terraform.tfvars to git — it contains secrets.
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+aws_region   = "us-east-1"
+project_name = "fipsar"
+environment  = "prod"
+
+# ── ECS sizing ────────────────────────────────────────────────────────────────
+# 1 vCPU / 2 GB is sufficient for a single-user Streamlit app.
+# Scale up to 2048/4096 for heavier analytics or multiple users.
+task_cpu    = 1024
+task_memory = 2048
+desired_count = 1
+
+# ── Snowflake ─────────────────────────────────────────────────────────────────
+snowflake_account   = "xy12345.us-east-1"   # from Snowflake Admin → Account URL
+snowflake_user      = "FIPSAR_APP_USER"
+snowflake_password  = "CHANGE_ME"
+snowflake_warehouse = "COMPUTE_WH"
+snowflake_database  = "FIPSAR_DW"
+snowflake_schema    = "GOLD"
+snowflake_role      = "SYSADMIN"
+
+# ── OpenAI ────────────────────────────────────────────────────────────────────
+openai_api_key = "sk-..."
+openai_model   = "gpt-4o"
+
+# ── Email (optional — leave blank to disable) ─────────────────────────────────
+email_smtp_host     = "smtp.gmail.com"
+email_smtp_port     = 587
+email_smtp_user     = "you@gmail.com"
+email_smtp_password = "your-app-password"   # Gmail App Password, not your login
+email_to            = "recipient@example.com"
