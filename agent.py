@@ -57,7 +57,7 @@ _checkpointer = MemorySaver()
 _agent = create_react_agent(
     model=_llm,
     tools=ALL_TOOLS,
-    state_modifier=SYSTEM_PROMPT,
+    prompt=SYSTEM_PROMPT,
     checkpointer=_checkpointer,
 )
 
