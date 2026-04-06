@@ -1,0 +1,9 @@
+[server]
+headless = true
+enableCORS = false
+port = 8501
+address = "0.0.0.0"
+
+[browser]
+# Suppresses the "You can now view your Streamlit app in your browser" message
+gatherUsageStats = false
