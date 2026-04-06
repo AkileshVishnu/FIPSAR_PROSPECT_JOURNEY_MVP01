@@ -220,7 +220,12 @@ SQL GENERATION INSTRUCTIONS:
   - Always include a date filter when the user asks about a specific date or period
   - Cap result sets to 100 rows unless the user requests more
   - For funnel drops: query both PHI_PROSPECT_MASTER counts AND DQ_REJECTION_LOG counts, then compare
-  - Use PATIENT_IDENTITY_XREF to bridge SUBSCRIBER_KEY (SFMC) to MASTER_PATIENT_ID (Prospect)
+  - SUBSCRIBER_KEY in SFMC event tables and FACT_SFMC_ENGAGEMENT IS the MASTER_PATIENT_ID (FIP... format).
+    Join directly: fe.SUBSCRIBER_KEY = dp.MASTER_PATIENT_ID — do NOT use PATIENT_IDENTITY_XREF for this join.
+    PATIENT_IDENTITY_XREF is for identity audit and email-based lookups only.
+  - RAW_SFMC_PROSPECT_C and RAW_SFMC_PROSPECT_JOURNEY_DETAILS use PROSPECT_ID (= MASTER_PATIENT_ID)
+  - Use get_sfmc_stage_suppression for per-stage suppression analysis across stages 1-9
+  - Use get_sfmc_prospect_outbound_match to reconcile DIM_PROSPECT vs what is in SFMC
 
 SFMC QUERY RULES — CRITICAL (violation causes all SFMC queries to return 0 rows):
 
@@ -264,19 +269,73 @@ SFMC QUERY RULES — CRITICAL (violation causes all SFMC queries to return 0 row
      GROUP BY 1, 2, 3
      ORDER BY 1, 2, 3
 
-  3. RAW SFMC TABLE COLUMNS (all tables share):
+  3. RAW SFMC TABLE COLUMNS (all event tables share):
      - SUBSCRIBER_KEY  — identity key linking to PATIENT_IDENTITY_XREF
      - JOB_ID          — links to DIM_SFMC_JOB for journey/stage resolution
      RAW_SFMC_BOUNCES also has: BOUNCE_CATEGORY, BOUNCE_TYPE (Hard/Soft)
      RAW_SFMC_CLICKS also has: URL (clicked link)
 
+     ADDITIONAL RAW SFMC TABLES (prospect/journey state):
+     - RAW_SFMC_PROSPECT_C: SFMC current snapshot. Key: PROSPECT_ID = MASTER_PATIENT_ID.
+       Columns: PROSPECT_ID, FIRST_NAME, LAST_NAME, EMAIL_ADDRESS, MARKETING_CONSENT, HIGH_ENGAGEMENT,
+                REGISTRATION_DATE, LAST_UPDATED
+       Use to reconcile: DIM_PROSPECT.MASTER_PATIENT_ID = RAW_SFMC_PROSPECT_C.PROSPECT_ID
+     - RAW_SFMC_PROSPECT_C_HISTORY: Historical batch loads of prospect attributes in SFMC.
+       Columns: PROSPECT_ID, FIRST_NAME, LAST_NAME, EMAIL_ADDRESS, MARKETING_CONSENT, HIGH_ENGAGEMENT,
+                REGISTRATION_DATE, BATCH_ID, JOB_ID, LAST_UPDATED
+     - RAW_SFMC_PROSPECT_JOURNEY_DETAILS: WIDE table — one row per prospect, per-stage sent flags.
+       Key column: PROSPECT_ID = MASTER_PATIENT_ID = SUBSCRIBER_KEY (all the same FIP... value)
+       Suppression: UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')
+       Per-stage sent columns (VARCHAR 'True'/'False' — use UPPER(TRIM())='TRUE' to test):
+         Stage 1: WELCOMEJOURNEY_WELCOMEEMAIL_SENT / _DATE
+         Stage 2: WELCOMEJOURNEY_EDUCATIONEMAIL_SENT / _DATE
+         Stage 3: NURTUREJOURNEY_EDUCATIONEMAIL1_SENT / _DATE
+         Stage 4: NURTUREJOURNEY_EDUCATIONEMAIL2_SENT / _DATE
+         Stage 5: NURTUREJOURNEY_PROSPECTSTORYEMAIL_SENT / _DATE
+         Stage 6: HIGHENGAGEMENT_CONVERSIONEMAIL_SENT / _DATE
+         Stage 7: HIGHENGAGEMENT_REMINDEREMAIL_SENT / _DATE
+         Stage 8: LOWENGAGEMENT_REENGAGEMENTEMAIL_SENT / _DATE
+         Stage 9: LOWENGAGEMENTFINALREMINDEREMAIL_SENT / _DATE
+       CALL get_sfmc_stage_suppression for all per-stage suppression questions.
+
+  3a. STAGE INTERVAL TIMINGS (days between stages — uniform for all prospects):
+      Stage 1→2: 3 days | Stage 2→3: 5 days | Stage 3→4: 8 days | Stage 4→5: 3 days
+      Stage 5→6: 2 days | Stage 6→7: 2 days | Stage 7→8: 2 days | Stage 8→9: 2 days
+
+  3b. INTER-STAGE DROP ANALYTICS — key pattern:
+     To answer "Prospect FIP000023 should have received Stage 3 email on DATE X but didn't":
+       Step 1: Query RAW_SFMC_PROSPECT_JOURNEY_DETAILS WHERE PROSPECT_ID = 'FIP000023'
+               → Check NURTUREJOURNEY_EDUCATIONEMAIL1_SENT (Stage 3 flag) and _SENT_DATE
+               → Check SUPPRESSION_FLAG
+       Step 2: JOIN RAW_SFMC_UNSUBSCRIBES ON SUBSCRIBER_KEY = PROSPECT_ID
+               → Get EVENT_DATE and REASON to explain why the email was not received
+     CALL get_sfmc_stage_suppression(target_date='YYYY-MM-DD', prospect_id='FIPxxxxxx') for this.
+
+     To answer "100 Stage 3 emails expected today, only 95 sent — 5 suppressed":
+       Query JOURNEY_DETAILS WHERE NURTUREJOURNEY_EDUCATIONEMAIL1_SENT_DATE = 'YYYY-MM-DD'
+       COUNT total (expected) vs COUNT WHERE SENT flag = 'True' (actual) vs WHERE SUPPRESSION_FLAG = TRUE (suppressed).
+     CALL get_sfmc_stage_suppression(target_date='YYYY-MM-DD') for this.
+
+     RAW_SFMC_UNSUBSCRIBES columns: ACCOUNT_ID, SUBSCRIBER_KEY, JOB_ID, EVENT_DATE (VARCHAR), REASON, RECORD_TYPE
+     EVENT_DATE is VARCHAR — use TRY_TO_DATE(EVENT_DATE) for date comparisons.
+     SUBSCRIBER_KEY = PROSPECT_ID = MASTER_PATIENT_ID (same FIP... value for all three).
+
+  3c. SFMC OUTBOUND / INBOUND RECONCILIATION:
+      Only ACTIVE DIM_PROSPECT records flow to SFMC via VW_SFMC_PROSPECT_OUTBOUND.
+      To check if a prospect reached SFMC: JOIN DIM_PROSPECT.MASTER_PATIENT_ID = RAW_SFMC_PROSPECT_C.PROSPECT_ID
+      Prospects in DIM but not in RAW_SFMC_PROSPECT_C = not yet exported or export failed.
+      CALL get_sfmc_prospect_outbound_match for all outbound reconciliation questions.
+
   4. SUPPRESSION & FATAL COUNTS:
      Always include DQ_REJECTION_LOG with dual date filter for suppression data:
-     WHERE UPPER(REJECTION_REASON) IN ('SUPPRESSED', 'FATAL_ERROR')
+     WHERE UPPER(REJECTION_REASON) IN ('SUPPRESSED_PROSPECT', 'FATAL_ERROR', 'SUPPRESSED')
        AND (
          TRY_TO_DATE(TRY_PARSE_JSON(REJECTED_RECORD):FILE_DATE::STRING) BETWEEN 'start' AND 'end'
          OR CAST(REJECTED_AT AS DATE) BETWEEN 'start' AND 'end'
        )
+     NOTE: The actual rejection reason written by SP_PROCESS_SFMC_SUPPRESSION is 'SUPPRESSED_PROSPECT'.
+     'SUPPRESSED' is included in filters for backward compatibility only.
+     TABLE_NAME = 'FACT_SFMC_ENGAGEMENT' for SFMC suppression rows in DQ_REJECTION_LOG.
 
   5. JOURNEY / STAGE RESOLUTION:
      DIM_SFMC_JOB columns: JOB_KEY, JOB_ID, JOURNEY_TYPE, MAPPED_STAGE, EMAIL_NAME, EMAIL_SUBJECT
@@ -299,23 +358,55 @@ DATA ACCURACY — MANDATORY RULES (violating these is a critical error):
      Do NOT recall numbers from earlier in the conversation — data can differ by date range.
 
   2. REJECTION CATEGORY DISTINCTION — this is a hard rule:
-     a. "Lead-to-Prospect conversion rejections" = records with reasons NULL_EMAIL, NO_CONSENT,
-        NULL_FIRST_NAME, NULL_LAST_NAME, NULL_PHONE_NUMBER.
-        These come from the intake/mastering pipeline. Always use rejection_category="intake".
-     b. "SFMC suppression / send failures" = records with reasons SUPPRESSED, FATAL_ERROR.
-        These are valid Prospects whose EMAIL SEND was blocked — they are NOT intake rejections.
+     a. "Lead-to-Prospect conversion rejections" = records with reasons NULL_EMAIL,
+        NULL_FIRST_NAME, NULL_LAST_NAME, NULL_PHONE_NUMBER, INVALID_FILE_DATE.
+        These come from Step 02 (STG_PROSPECT_INTAKE → PHI_PROSPECT_MASTER mastering).
+        DQ_REJECTION_LOG.TABLE_NAME = 'PHI_PROSPECT_MASTER' for these rows.
+        Always use rejection_category="intake".
+        NOTE: NO_CONSENT is NOT enforced by the current mastering SP — do NOT include it
+        in intake rejection counts.
+     b. "Silver deduplication rejections" = DUPLICATE_RECORD_ID, DUPLICATE_RECORD_ID_IN_BRONZE.
+        These are valid Prospects that are duplicates caught at the Bronze → Silver step (Step 04).
+        Dedup key is RECORD_ID (not MASTER_PATIENT_ID).
+        DQ_REJECTION_LOG.TABLE_NAME = 'SLV_PROSPECT_MASTER' for these rows.
+        Do NOT count these as invalid leads — the Prospect is valid, just de-duped.
+     c. "SFMC suppression / send failures" = records with REJECTION_REASON = 'SUPPRESSED_PROSPECT'
+        (or 'FATAL_ERROR'). These are valid Prospects whose EMAIL SEND was blocked (Step 10b).
+        Sourced from RAW_SFMC_PROSPECT_JOURNEY_DETAILS.SUPPRESSION_FLAG IN ('YES','Y','TRUE','1').
+        DQ_REJECTION_LOG.TABLE_NAME = 'FACT_SFMC_ENGAGEMENT' for these rows.
         Always use rejection_category="sfmc" for these.
-     c. NEVER include SUPPRESSED or FATAL_ERROR when answering questions about why leads
+     d. NEVER include SUPPRESSED_PROSPECT or FATAL_ERROR when answering questions about why leads
         failed to convert to Prospects. They happen at a completely different funnel stage.
-     d. NEVER include NULL_EMAIL or NO_CONSENT when answering questions about SFMC send issues.
+     e. NEVER include NULL_EMAIL, NULL_PHONE_NUMBER, or DUPLICATE_RECORD_ID when answering
+        questions about SFMC send issues.
+     f. When a Prospect has SUPPRESSION_FLAG IN ('YES','Y','TRUE','1') in JOURNEY_DETAILS:
+        - They appear in DQ_REJECTION_LOG with REJECTION_REASON = 'SUPPRESSED_PROSPECT', TABLE_NAME = 'FACT_SFMC_ENGAGEMENT'
+        - They appear in FACT_SFMC_ENGAGEMENT with IS_SUPPRESSED = TRUE, SUPPRESSION_REASON = 'SUPPRESSION_FLAG=YES'
+        - This is counted as funnel loss at F04 (SFMC Planned / Sent / Suppressed)
+        - Suppression can happen at ANY stage (1-9). Use get_sfmc_stage_suppression to see which stage.
 
-  3. When the user asks "top N reasons", call get_rejection_analysis with the correct
+  3a. SFMC OUTBOUND / INBOUND INTEGRITY — key rule:
+     Only ACTIVE DIM_PROSPECT records are exported to SFMC via VW_SFMC_PROSPECT_OUTBOUND.
+     When user asks about SFMC inbound, journey targeting, or "which prospects are in SFMC":
+     - Use get_sfmc_prospect_outbound_match to compare DIM_PROSPECT vs RAW_SFMC_PROSPECT_C
+     - Prospects in DIM_PROSPECT but not in RAW_SFMC_PROSPECT_C = export gap
+     - Prospects in RAW_SFMC_PROSPECT_C with no DIM_PROSPECT match = data integrity issue
+
+  4. When the user asks "top N reasons", call get_rejection_analysis with the correct
      rejection_category, then report only what the tool returned — no guessing or adjusting.
 
-  4. If a count doesn't add up (e.g., leads − prospects ≠ rejection log count), explain
+  5. If a count doesn't add up (e.g., leads − prospects ≠ rejection log count), explain
      the gap: some rejections may be logged under a different timestamp (REJECTED_AT)
      than the lead's FILE_DATE. Always trust arithmetic (leads − prospects) for invalid
      lead counts over the rejection log date filter.
+
+  6. TOOL SELECTION FOR THE 6 KEY ANALYTICAL AREAS:
+     Area 1 — Leads to Prospects (PHI DB, DQ_logs): use get_funnel_metrics + get_rejection_analysis(category="intake")
+     Area 2 — Bronze to Gold (Silver DQ, dedup, SCD2): use get_pipeline_observability + get_rejection_analysis(category="all") filtered to TABLE_NAME='SLV_PROSPECT_MASTER'
+     Area 3 — SFMC Inbound (active DIM_PROSPECT → SFMC): use get_sfmc_prospect_outbound_match
+     Area 4 — SFMC History matching (RAW_SFMC_PROSPECT_C vs DIM_PROSPECT): use get_sfmc_prospect_outbound_match
+     Area 5 — Per-stage suppression (Stages 01-09): use get_sfmc_stage_suppression
+     Area 6 — Final SFMC event data: use get_sfmc_engagement_stats (gold first, raw fallback)
 """.strip()
 
     # --- Charting guidance ---
@@ -345,28 +436,63 @@ CHARTING RULES — when to generate charts:
 
     # --- Output formatting rules ---
     formatting_rules = """
-OUTPUT FORMATTING — always structure responses as follows:
+OUTPUT FORMATTING — dynamically choose format based on the question type. Do NOT default to one format for all answers.
 
-  1. Start with a **bold headline summary** — one or two sentences stating the key finding.
+RULE: Read the question intent, then pick the format that serves that intent best.
 
-  2. Use **## Section Headers** to separate: Summary, Conversion Details, Rejection Details,
-     SFMC Events, AI Scores, etc. depending on what was asked.
+─────────────────────────────────────────────────────────────────────
+FORMAT A — STRUCTURED TABLE  (use when the user asks for counts, comparisons, breakdowns, rankings, or lists of records)
+  Signals: "how many", "show me the", "list", "top N", "breakdown by", "which stages", "give me the records"
+  Format:
+    - Lead with one bold sentence summarising the key number or finding.
+    - Present data as a markdown table immediately.
+    - Follow the table with 1–2 plain sentences interpreting it in business terms.
+  Example trigger: "How many leads were rejected by reason?"
 
-  3. Present metrics as a **bullet list with bold labels**:
-     - **Total Leads Intake:** 335
-     - **Valid Prospects Converted:** 318
-     - **Invalid Leads (Failed Mastering):** 17
-     - **Conversion Rate:** 94.93%
+─────────────────────────────────────────────────────────────────────
+FORMAT B — BULLET POINT SUMMARY  (use when the user asks for a quick overview, health check, or status summary)
+  Signals: "give me a summary", "what is the status", "quick overview", "funnel summary", "how is the pipeline doing"
+  Format:
+    - Bold headline (1 sentence).
+    - Bullet list with bold metric labels and values:
+        - **Total Leads Intake:** 335
+        - **Valid Prospects:** 318
+        - **Conversion Rate:** 94.93%
+    - 1 sentence closing insight.
+  Example trigger: "Give me a quick funnel summary."
 
-  4. When showing a data table: always precede it with a one-line description of what it shows.
+─────────────────────────────────────────────────────────────────────
+FORMAT C — NARRATIVE / EXPLANATION  (use when the user asks WHY, HOW, or WHAT DOES IT MEAN)
+  Signals: "why", "explain", "what does", "what is", "how does", "what happened", "describe"
+  Format:
+    - Answer in 2–4 plain sentences or short paragraphs.
+    - Include table or bullets only if they add clarity, not by default.
+    - Use business language; explain pipeline mechanics in plain terms.
+  Example trigger: "Why might there be a drop in prospects?"
 
-  5. After every data table, add a 1–2 sentence **insight or interpretation** explaining
-     what the numbers mean in business terms.
+─────────────────────────────────────────────────────────────────────
+FORMAT D — MIXED / EXECUTIVE REPORT  (use for multi-part questions or when the user asks for a full picture)
+  Signals: "full picture", "end-to-end", "show everything", "complete analysis", "executive view"
+  Format:
+    - ## Section headers for each major area (Summary, Funnel, SFMC, Rejections, etc.)
+    - Combine bullets, tables, and 1–2 sentences of narrative per section.
+    - End with a "Key Takeaways" bullet list.
+  Example trigger: "Give me the complete funnel and engagement picture."
 
-  6. If the user asks a follow-up refining the date range or adding a filter, re-query and
-     update ALL numbers — do not mix figures from different queries.
+─────────────────────────────────────────────────────────────────────
+FORMAT E — CONVERSATIONAL / SHORT ANSWER  (use for simple lookups, yes/no questions, single-fact answers)
+  Signals: "what is X?", "is there data for Y?", "does Z exist?", single-metric follow-ups
+  Format:
+    - 1–3 sentences maximum. No headers, no bullets unless listing 2+ items.
+  Example trigger: "What is the rejection rate?" (as a follow-up after already seeing the funnel)
 
-  7. Use clear section separation. Never dump a raw table without context around it.
+─────────────────────────────────────────────────────────────────────
+UNIVERSAL RULES (always apply regardless of format):
+  - Never dump a raw table without at least one sentence of context before it.
+  - Never state a number without having queried for it first.
+  - If a follow-up changes the date range or filter, re-query — never reuse prior numbers.
+  - When physical column names say MASTER_PATIENT_ID or PATIENT, translate to "Master Prospect ID" / "Prospect" in your answer.
+  - For charts: always call the chart tool alongside the data — do not describe a chart in text only.
 """.strip()
 
     # --- Compose final prompt ---

@@ -117,44 +117,39 @@ def get_funnel_metrics(start_date: str = "2020-01-01", end_date: str = "2099-12-
         sent AS (
             SELECT COUNT(*) AS sent_count
             FROM FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-            JOIN FIPSAR_DW.GOLD.DIM_DATE d ON fe.DATE_KEY = d.DATE_KEY
             WHERE fe.EVENT_TYPE = 'SENT'
-              AND d.FULL_DATE BETWEEN '{start_date}' AND '{end_date}'
+              AND DATE(fe.EVENT_TIMESTAMP) BETWEEN '{start_date}' AND '{end_date}'
         ),
         opens AS (
             SELECT COUNT(*) AS open_count,
                    SUM(CASE WHEN IS_UNIQUE = 1 THEN 1 ELSE 0 END) AS unique_open_count
             FROM FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-            JOIN FIPSAR_DW.GOLD.DIM_DATE d ON fe.DATE_KEY = d.DATE_KEY
             WHERE fe.EVENT_TYPE = 'OPEN'
-              AND d.FULL_DATE BETWEEN '{start_date}' AND '{end_date}'
+              AND DATE(fe.EVENT_TIMESTAMP) BETWEEN '{start_date}' AND '{end_date}'
         ),
         clicks AS (
             SELECT COUNT(*) AS click_count,
                    SUM(CASE WHEN IS_UNIQUE = 1 THEN 1 ELSE 0 END) AS unique_click_count
             FROM FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-            JOIN FIPSAR_DW.GOLD.DIM_DATE d ON fe.DATE_KEY = d.DATE_KEY
             WHERE fe.EVENT_TYPE = 'CLICK'
-              AND d.FULL_DATE BETWEEN '{start_date}' AND '{end_date}'
+              AND DATE(fe.EVENT_TIMESTAMP) BETWEEN '{start_date}' AND '{end_date}'
         ),
         bounces AS (
             SELECT COUNT(*) AS bounce_count
             FROM FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-            JOIN FIPSAR_DW.GOLD.DIM_DATE d ON fe.DATE_KEY = d.DATE_KEY
             WHERE fe.EVENT_TYPE = 'BOUNCE'
-              AND d.FULL_DATE BETWEEN '{start_date}' AND '{end_date}'
+              AND DATE(fe.EVENT_TIMESTAMP) BETWEEN '{start_date}' AND '{end_date}'
         ),
         unsubs AS (
             SELECT COUNT(*) AS unsubscribe_count
             FROM FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-            JOIN FIPSAR_DW.GOLD.DIM_DATE d ON fe.DATE_KEY = d.DATE_KEY
             WHERE fe.EVENT_TYPE = 'UNSUBSCRIBE'
-              AND d.FULL_DATE BETWEEN '{start_date}' AND '{end_date}'
+              AND DATE(fe.EVENT_TIMESTAMP) BETWEEN '{start_date}' AND '{end_date}'
         ),
         suppressed AS (
             SELECT COUNT(*) AS suppressed_count
             FROM FIPSAR_AUDIT.PIPELINE_AUDIT.DQ_REJECTION_LOG
-            WHERE REJECTION_REASON IN ('SUPPRESSED', 'FATAL_ERROR')
+            WHERE UPPER(REJECTION_REASON) IN ('SUPPRESSED_PROSPECT', 'FATAL_ERROR', 'SUPPRESSED')
               AND CAST(REJECTED_AT AS DATE) BETWEEN '{start_date}' AND '{end_date}'
         )
         SELECT
@@ -229,9 +224,11 @@ def get_rejection_analysis(
         else ""
     )
     if rejection_category == "intake":
-        category_filter = "AND UPPER(REJECTION_REASON) NOT IN ('SUPPRESSED', 'FATAL_ERROR')"
+        # Intake mastering rejections only — exclude SFMC suppression outcomes
+        category_filter = "AND UPPER(REJECTION_REASON) NOT IN ('SUPPRESSED_PROSPECT', 'FATAL_ERROR', 'SUPPRESSED')"
     elif rejection_category == "sfmc":
-        category_filter = "AND UPPER(REJECTION_REASON) IN ('SUPPRESSED', 'FATAL_ERROR')"
+        # SFMC suppression / fatal outcomes only
+        category_filter = "AND UPPER(REJECTION_REASON) IN ('SUPPRESSED_PROSPECT', 'FATAL_ERROR', 'SUPPRESSED')"
     else:
         category_filter = ""
     sql = textwrap.dedent(f"""
@@ -394,7 +391,7 @@ def get_sfmc_engagement_stats(
             MIN(CAST(REJECTED_AT AS DATE))  AS first_seen,
             MAX(CAST(REJECTED_AT AS DATE))  AS last_seen
         FROM FIPSAR_AUDIT.PIPELINE_AUDIT.DQ_REJECTION_LOG
-        WHERE UPPER(REJECTION_REASON) IN ('SUPPRESSED', 'FATAL_ERROR')
+        WHERE UPPER(REJECTION_REASON) IN ('SUPPRESSED_PROSPECT', 'FATAL_ERROR', 'SUPPRESSED')
           AND (
               TRY_TO_DATE(TRY_PARSE_JSON(REJECTED_RECORD):FILE_DATE::STRING)
                   BETWEEN '{start_date}' AND '{end_date}'
@@ -467,8 +464,7 @@ def get_drop_analysis(target_date: str) -> str:
                COUNT(*) AS count,
                '{target_date}' AS date
         FROM FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-        JOIN FIPSAR_DW.GOLD.DIM_DATE d ON fe.DATE_KEY = d.DATE_KEY
-        WHERE d.FULL_DATE = '{target_date}'
+        WHERE DATE(fe.EVENT_TIMESTAMP) = '{target_date}'
         GROUP BY fe.EVENT_TYPE
 
         UNION ALL
@@ -477,7 +473,7 @@ def get_drop_analysis(target_date: str) -> str:
                COUNT(*) AS count,
                '{target_date}' AS date
         FROM FIPSAR_AUDIT.PIPELINE_AUDIT.DQ_REJECTION_LOG
-        WHERE REJECTION_REASON IN ('SUPPRESSED', 'FATAL_ERROR')
+        WHERE UPPER(REJECTION_REASON) IN ('SUPPRESSED_PROSPECT', 'FATAL_ERROR', 'SUPPRESSED')
           AND CAST(REJECTED_AT AS DATE) = '{target_date}'
         GROUP BY REJECTION_REASON
 
@@ -564,16 +560,21 @@ def trace_prospect(identifier: str) -> str:
     """)
     base_result = _run(sql, max_rows=50)
 
-    # Step 5: Also pull engagement if we have an identity key — do best-effort
+    # Step 5: Pull engagement events — SUBSCRIBER_KEY IS the MASTER_PATIENT_ID (FIP... format).
+    # Join directly to PHI_PROSPECT_MASTER or DIM_PROSPECT — no PATIENT_IDENTITY_XREF needed.
+    if is_email:
+        sub_filter = f"LOWER(p.EMAIL) = LOWER('{identifier}')"
+    else:
+        sub_filter = f"p.MASTER_PATIENT_ID = '{identifier}'"
+
     engagement_sql = textwrap.dedent(f"""
         SELECT fe.EVENT_TYPE, fe.EVENT_TIMESTAMP, j.JOURNEY_TYPE, j.MAPPED_STAGE,
-               fe.SUBSCRIBER_KEY
-        FROM FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-        JOIN FIPSAR_DW.GOLD.DIM_SFMC_JOB j ON fe.JOB_KEY = j.JOB_KEY
-        JOIN FIPSAR_PHI_HUB.PHI_CORE.PATIENT_IDENTITY_XREF x
-             ON fe.SUBSCRIBER_KEY = x.IDENTITY_KEY
-        WHERE {'LOWER(x.EMAIL) = LOWER(' + chr(39) + identifier + chr(39) + ')' if is_email
-               else 'x.MASTER_PATIENT_ID = ' + chr(39) + identifier + chr(39)}
+               fe.SUBSCRIBER_KEY, fe.IS_SUPPRESSED, fe.SUPPRESSION_REASON
+        FROM FIPSAR_PHI_HUB.PHI_CORE.PHI_PROSPECT_MASTER p
+        JOIN FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
+             ON fe.SUBSCRIBER_KEY = p.MASTER_PATIENT_ID
+        LEFT JOIN FIPSAR_DW.GOLD.DIM_SFMC_JOB j ON fe.JOB_KEY = j.JOB_KEY
+        WHERE {sub_filter}
         ORDER BY fe.EVENT_TIMESTAMP
         LIMIT 50
     """)
@@ -717,8 +718,10 @@ def get_prospect_conversion_analysis(
     if engagement_rows > 0:
         seg_sql = textwrap.dedent(f"""
             WITH pe AS (
+                -- SUBSCRIBER_KEY in FACT_SFMC_ENGAGEMENT IS the MASTER_PATIENT_ID (FIP... format).
+                -- Join directly — no PATIENT_IDENTITY_XREF needed.
                 SELECT
-                    x.MASTER_PATIENT_ID,
+                    p.MASTER_PATIENT_ID,
                     p.FIRST_NAME, p.LAST_NAME, p.EMAIL, p.CHANNEL,
                     p.FILE_DATE AS intake_date,
                     COUNT(CASE WHEN fe.EVENT_TYPE = 'SENT'        THEN 1 END) AS sends,
@@ -729,10 +732,8 @@ def get_prospect_conversion_analysis(
                     COUNT(CASE WHEN fe.EVENT_TYPE = 'SPAM'        THEN 1 END) AS spam_complaints,
                     MAX(fe.EVENT_TIMESTAMP)                                    AS last_event_ts
                 FROM FIPSAR_PHI_HUB.PHI_CORE.PHI_PROSPECT_MASTER p
-                JOIN FIPSAR_PHI_HUB.PHI_CORE.PATIENT_IDENTITY_XREF x
-                     ON p.MASTER_PATIENT_ID = x.MASTER_PATIENT_ID
                 JOIN FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-                     ON x.IDENTITY_KEY = fe.SUBSCRIBER_KEY
+                     ON fe.SUBSCRIBER_KEY = p.MASTER_PATIENT_ID
                 WHERE fe.EVENT_TIMESTAMP BETWEEN '{start_date}' AND '{end_date}'
                   {active_filter}
                 GROUP BY 1,2,3,4,5,6
@@ -759,17 +760,15 @@ def get_prospect_conversion_analysis(
 
         summary_sql = textwrap.dedent(f"""
             WITH pe AS (
-                SELECT x.MASTER_PATIENT_ID,
+                SELECT p.MASTER_PATIENT_ID,
                     COUNT(CASE WHEN fe.EVENT_TYPE='SENT'        THEN 1 END) AS sends,
                     COUNT(CASE WHEN fe.EVENT_TYPE='OPEN'        THEN 1 END) AS opens,
                     COUNT(CASE WHEN fe.EVENT_TYPE='CLICK'       THEN 1 END) AS clicks,
                     COUNT(CASE WHEN fe.EVENT_TYPE='BOUNCE'      THEN 1 END) AS bounces,
                     COUNT(CASE WHEN fe.EVENT_TYPE='UNSUBSCRIBE' THEN 1 END) AS unsubscribes
                 FROM FIPSAR_PHI_HUB.PHI_CORE.PHI_PROSPECT_MASTER p
-                JOIN FIPSAR_PHI_HUB.PHI_CORE.PATIENT_IDENTITY_XREF x
-                     ON p.MASTER_PATIENT_ID = x.MASTER_PATIENT_ID
                 JOIN FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
-                     ON x.IDENTITY_KEY = fe.SUBSCRIBER_KEY
+                     ON fe.SUBSCRIBER_KEY = p.MASTER_PATIENT_ID
                 WHERE fe.EVENT_TIMESTAMP BETWEEN '{start_date}' AND '{end_date}'
                   {active_filter}
                 GROUP BY 1
@@ -876,7 +875,7 @@ def get_prospect_conversion_analysis(
                 WHERE FILE_DATE BETWEEN '{start_date}' AND '{end_date}'
             ), 2)                                                          AS pct_of_prospects
         FROM FIPSAR_AUDIT.PIPELINE_AUDIT.DQ_REJECTION_LOG
-        WHERE UPPER(REJECTION_REASON) IN ('SUPPRESSED','FATAL_ERROR')
+        WHERE UPPER(REJECTION_REASON) IN ('SUPPRESSED_PROSPECT','FATAL_ERROR','SUPPRESSED')
           AND (
               TRY_TO_DATE(TRY_PARSE_JSON(REJECTED_RECORD):FILE_DATE::STRING)
                   BETWEEN '{start_date}' AND '{end_date}'
@@ -1003,9 +1002,9 @@ def get_rejected_lead_details(
         else ""
     )
     if rejection_category == "intake":
-        category_filter = "AND UPPER(REJECTION_REASON) NOT IN ('SUPPRESSED', 'FATAL_ERROR')"
+        category_filter = "AND UPPER(REJECTION_REASON) NOT IN ('SUPPRESSED_PROSPECT', 'FATAL_ERROR', 'SUPPRESSED')"
     elif rejection_category == "sfmc":
-        category_filter = "AND UPPER(REJECTION_REASON) IN ('SUPPRESSED', 'FATAL_ERROR')"
+        category_filter = "AND UPPER(REJECTION_REASON) IN ('SUPPRESSED_PROSPECT', 'FATAL_ERROR', 'SUPPRESSED')"
     else:
         category_filter = ""
     sql = textwrap.dedent(f"""
@@ -1099,6 +1098,306 @@ def get_prospect_details(
         LIMIT {limit}
     """)
     return _run(sql, max_rows=limit)
+
+
+# ---------------------------------------------------------------------------
+# Tool 11b: Per-stage SFMC journey suppression analysis
+# ---------------------------------------------------------------------------
+
+@tool
+def get_sfmc_stage_suppression(
+    target_date: Optional[str] = None,
+    prospect_id: Optional[str] = None,
+) -> str:
+    """
+    Analyse suppression across all 9 SFMC journey stages.
+
+    Answers questions like:
+    - "How many Stage 3 emails were expected today but not sent?"
+    - "Prospect FIP000023 — which stage were they suppressed at and why?"
+    - "Show per-stage expected vs actual send counts for a given date"
+    - "Which prospects were suppressed and at what stage?"
+    - "Why did prospect X not receive the Stage 3 email?"
+    - "Today 100 Stage 3 emails expected — how many were suppressed?"
+
+    Logic:
+      - Uses RAW_SFMC_PROSPECT_JOURNEY_DETAILS (wide table) for per-stage sent flags + dates.
+      - Identifies the LAST stage a suppressed prospect received (sent = 'True') to determine
+        AT WHICH STAGE suppression took effect.
+      - Joins RAW_SFMC_UNSUBSCRIBES (SUBSCRIBER_KEY = PROSPECT_ID) to show WHY the prospect
+        did not receive the next expected email (unsubscribe reason + date).
+
+    Args:
+        target_date: Optional date (YYYY-MM-DD) to scope expected-vs-actual to a specific day.
+        prospect_id: Optional specific MASTER_PATIENT_ID (FIP... format) for single-prospect trace.
+
+    Returns:
+        Stage-level summary + suppressed prospect detail with unsubscribe reason.
+    """
+    prospect_filter = f"AND jd.PROSPECT_ID = '{prospect_id}'" if prospect_id else ""
+    date_filter_s1  = f"AND jd.WELCOMEJOURNEY_WELCOMEEMAIL_SENT_DATE = '{target_date}'"       if target_date else ""
+    date_filter_s2  = f"AND jd.WELCOMEJOURNEY_EDUCATIONEMAIL_SENT_DATE = '{target_date}'"      if target_date else ""
+    date_filter_s3  = f"AND jd.NURTUREJOURNEY_EDUCATIONEMAIL1_SENT_DATE = '{target_date}'"    if target_date else ""
+    date_filter_s4  = f"AND jd.NURTUREJOURNEY_EDUCATIONEMAIL2_SENT_DATE = '{target_date}'"    if target_date else ""
+    date_filter_s5  = f"AND jd.NURTUREJOURNEY_PROSPECTSTORYEMAIL_SENT_DATE = '{target_date}'" if target_date else ""
+    date_filter_s6  = f"AND jd.HIGHENGAGEMENT_CONVERSIONEMAIL_SENT_DATE = '{target_date}'"    if target_date else ""
+    date_filter_s7  = f"AND jd.HIGHENGAGEMENT_REMINDEREMAIL_SENT_DATE = '{target_date}'"      if target_date else ""
+    date_filter_s8  = f"AND jd.LOWENGAGEMENT_REENGAGEMENTEMAIL_SENT_DATE = '{target_date}'"   if target_date else ""
+    date_filter_s9  = f"AND jd.LOWENGAGEMENTFINALREMINDEREMAIL_SENT_DATE = '{target_date}'"   if target_date else ""
+
+    # --- PART 1: Per-stage expected vs actual counts ---
+    stage_summary_sql = textwrap.dedent(f"""
+        SELECT
+            'Stage 1 — Welcome Email (J01)'         AS stage,
+            COUNT(*)                                 AS total_prospects,
+            SUM(CASE WHEN UPPER(TRIM(WELCOMEJOURNEY_WELCOMEEMAIL_SENT)) = 'TRUE'    THEN 1 ELSE 0 END) AS sent,
+            SUM(CASE WHEN UPPER(TRIM(WELCOMEJOURNEY_WELCOMEEMAIL_SENT)) != 'TRUE'   THEN 1 ELSE 0 END) AS not_sent,
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')   THEN 1 ELSE 0 END) AS suppressed
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        UNION ALL
+        SELECT 'Stage 2 — Education Email (J01)', COUNT(*),
+            SUM(CASE WHEN UPPER(TRIM(WELCOMEJOURNEY_EDUCATIONEMAIL_SENT)) = 'TRUE'  THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(WELCOMEJOURNEY_EDUCATIONEMAIL_SENT)) != 'TRUE' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')   THEN 1 ELSE 0 END)
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        UNION ALL
+        SELECT 'Stage 3 — Nurture Edu Email 1 (J02)', COUNT(*),
+            SUM(CASE WHEN UPPER(TRIM(NURTUREJOURNEY_EDUCATIONEMAIL1_SENT)) = 'TRUE'  THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(NURTUREJOURNEY_EDUCATIONEMAIL1_SENT)) != 'TRUE' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')    THEN 1 ELSE 0 END)
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        UNION ALL
+        SELECT 'Stage 4 — Nurture Edu Email 2 (J02)', COUNT(*),
+            SUM(CASE WHEN UPPER(TRIM(NURTUREJOURNEY_EDUCATIONEMAIL2_SENT)) = 'TRUE'  THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(NURTUREJOURNEY_EDUCATIONEMAIL2_SENT)) != 'TRUE' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')    THEN 1 ELSE 0 END)
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        UNION ALL
+        SELECT 'Stage 5 — Prospect Story Email (J02)', COUNT(*),
+            SUM(CASE WHEN UPPER(TRIM(NURTUREJOURNEY_PROSPECTSTORYEMAIL_SENT)) = 'TRUE'  THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(NURTUREJOURNEY_PROSPECTSTORYEMAIL_SENT)) != 'TRUE' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')       THEN 1 ELSE 0 END)
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        UNION ALL
+        SELECT 'Stage 6 — Conversion Email (J03)', COUNT(*),
+            SUM(CASE WHEN UPPER(TRIM(HIGHENGAGEMENT_CONVERSIONEMAIL_SENT)) = 'TRUE'  THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(HIGHENGAGEMENT_CONVERSIONEMAIL_SENT)) != 'TRUE' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')    THEN 1 ELSE 0 END)
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        UNION ALL
+        SELECT 'Stage 7 — Reminder Email (J03)', COUNT(*),
+            SUM(CASE WHEN UPPER(TRIM(HIGHENGAGEMENT_REMINDEREMAIL_SENT)) = 'TRUE'  THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(HIGHENGAGEMENT_REMINDEREMAIL_SENT)) != 'TRUE' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')  THEN 1 ELSE 0 END)
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        UNION ALL
+        SELECT 'Stage 8 — Re-engagement Email (J04)', COUNT(*),
+            SUM(CASE WHEN UPPER(TRIM(LOWENGAGEMENT_REENGAGEMENTEMAIL_SENT)) = 'TRUE'  THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(LOWENGAGEMENT_REENGAGEMENTEMAIL_SENT)) != 'TRUE' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')     THEN 1 ELSE 0 END)
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        UNION ALL
+        SELECT 'Stage 9 — Final Reminder Email (J04)', COUNT(*),
+            SUM(CASE WHEN UPPER(TRIM(LOWENGAGEMENTFINALREMINDEREMAIL_SENT)) = 'TRUE'  THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(LOWENGAGEMENTFINALREMINDEREMAIL_SENT)) != 'TRUE' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN UPPER(TRIM(SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')     THEN 1 ELSE 0 END)
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+        WHERE 1=1 {prospect_filter}
+        ORDER BY stage
+    """)
+    stage_result = _run(stage_summary_sql, max_rows=9)
+
+    # --- PART 2: Per-suppressed-prospect: last stage reached + unsubscribe reason ---
+    # Determines WHERE in the journey suppression hit, and WHY (via UNSUBSCRIBES table).
+    # SUBSCRIBER_KEY in RAW_SFMC_UNSUBSCRIBES = PROSPECT_ID (both = MASTER_PATIENT_ID).
+    suppressed_detail_sql = textwrap.dedent(f"""
+        WITH journey AS (
+            SELECT
+                jd.PROSPECT_ID,
+                jd.SUPPRESSION_FLAG,
+                -- Identify last stage reached (last email sent = True)
+                CASE
+                    WHEN UPPER(TRIM(jd.LOWENGAGEMENTFINALREMINDEREMAIL_SENT))  = 'TRUE' THEN 'Stage 9 — Final Reminder'
+                    WHEN UPPER(TRIM(jd.LOWENGAGEMENT_REENGAGEMENTEMAIL_SENT))  = 'TRUE' THEN 'Stage 8 — Re-engagement'
+                    WHEN UPPER(TRIM(jd.HIGHENGAGEMENT_REMINDEREMAIL_SENT))     = 'TRUE' THEN 'Stage 7 — Reminder'
+                    WHEN UPPER(TRIM(jd.HIGHENGAGEMENT_CONVERSIONEMAIL_SENT))   = 'TRUE' THEN 'Stage 6 — Conversion'
+                    WHEN UPPER(TRIM(jd.NURTUREJOURNEY_PROSPECTSTORYEMAIL_SENT))= 'TRUE' THEN 'Stage 5 — Prospect Story'
+                    WHEN UPPER(TRIM(jd.NURTUREJOURNEY_EDUCATIONEMAIL2_SENT))   = 'TRUE' THEN 'Stage 4 — Nurture Edu2'
+                    WHEN UPPER(TRIM(jd.NURTUREJOURNEY_EDUCATIONEMAIL1_SENT))   = 'TRUE' THEN 'Stage 3 — Nurture Edu1'
+                    WHEN UPPER(TRIM(jd.WELCOMEJOURNEY_EDUCATIONEMAIL_SENT))    = 'TRUE' THEN 'Stage 2 — Education Email'
+                    WHEN UPPER(TRIM(jd.WELCOMEJOURNEY_WELCOMEEMAIL_SENT))      = 'TRUE' THEN 'Stage 1 — Welcome Email'
+                    ELSE 'No emails sent yet'
+                END AS last_stage_reached,
+                -- Last email date (most recent date across all stages)
+                GREATEST(
+                    COALESCE(TRY_TO_DATE(jd.WELCOMEJOURNEY_WELCOMEEMAIL_SENT_DATE), '1900-01-01'),
+                    COALESCE(TRY_TO_DATE(jd.WELCOMEJOURNEY_EDUCATIONEMAIL_SENT_DATE), '1900-01-01'),
+                    COALESCE(TRY_TO_DATE(jd.NURTUREJOURNEY_EDUCATIONEMAIL1_SENT_DATE), '1900-01-01'),
+                    COALESCE(TRY_TO_DATE(jd.NURTUREJOURNEY_EDUCATIONEMAIL2_SENT_DATE), '1900-01-01'),
+                    COALESCE(TRY_TO_DATE(jd.NURTUREJOURNEY_PROSPECTSTORYEMAIL_SENT_DATE), '1900-01-01'),
+                    COALESCE(TRY_TO_DATE(jd.HIGHENGAGEMENT_CONVERSIONEMAIL_SENT_DATE), '1900-01-01'),
+                    COALESCE(TRY_TO_DATE(jd.HIGHENGAGEMENT_REMINDEREMAIL_SENT_DATE), '1900-01-01'),
+                    COALESCE(TRY_TO_DATE(jd.LOWENGAGEMENT_REENGAGEMENTEMAIL_SENT_DATE), '1900-01-01'),
+                    COALESCE(TRY_TO_DATE(jd.LOWENGAGEMENTFINALREMINDEREMAIL_SENT_DATE), '1900-01-01')
+                ) AS last_email_date
+            FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_JOURNEY_DETAILS jd
+            WHERE UPPER(TRIM(jd.SUPPRESSION_FLAG)) IN ('YES','Y','TRUE','1')
+              {prospect_filter}
+        )
+        SELECT
+            j.PROSPECT_ID,
+            j.last_stage_reached,
+            j.last_email_date,
+            -- Unsubscribe details — why this prospect stopped receiving emails
+            u.EVENT_DATE          AS unsubscribe_date,
+            u.REASON              AS unsubscribe_reason,
+            u.JOB_ID              AS unsubscribe_job_id,
+            CASE
+                WHEN u.SUBSCRIBER_KEY IS NOT NULL THEN 'Unsubscribed'
+                ELSE 'Suppressed (non-unsubscribe reason)'
+            END AS suppression_type
+        FROM journey j
+        LEFT JOIN FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_UNSUBSCRIBES u
+               ON u.SUBSCRIBER_KEY = j.PROSPECT_ID
+        ORDER BY j.last_email_date DESC NULLS LAST
+        LIMIT 100
+    """)
+    detail_result = _run(suppressed_detail_sql, max_rows=100)
+
+    # --- PART 3: Unsubscribe reason summary ---
+    unsub_summary_sql = textwrap.dedent("""
+        SELECT
+            COALESCE(u.REASON, '(no reason provided)') AS unsubscribe_reason,
+            COUNT(DISTINCT u.SUBSCRIBER_KEY)            AS prospect_count,
+            MIN(u.EVENT_DATE)                           AS first_unsubscribe_date,
+            MAX(u.EVENT_DATE)                           AS last_unsubscribe_date
+        FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_UNSUBSCRIBES u
+        GROUP BY 1
+        ORDER BY 2 DESC
+    """)
+    unsub_result = _run(unsub_summary_sql, max_rows=20)
+
+    return (
+        "### Per-Stage Send / Not-Sent / Suppressed Count\n"
+        + stage_result
+        + "\n\n### Suppressed Prospects — Last Stage Reached + Unsubscribe Reason\n"
+        + detail_result
+        + "\n\n### Unsubscribe Reason Summary (RAW_SFMC_UNSUBSCRIBES)\n"
+        + unsub_result
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool 11c: SFMC Outbound / Inbound prospect reconciliation
+# ---------------------------------------------------------------------------
+
+@tool
+def get_sfmc_prospect_outbound_match(
+    limit: int = 100,
+) -> str:
+    """
+    Reconcile DIM_PROSPECT (outbound to SFMC) vs RAW_SFMC_PROSPECT_C (what is actually loaded in SFMC).
+
+    Only ACTIVE records from DIM_PROSPECT are exported to SFMC via VW_SFMC_PROSPECT_OUTBOUND.
+    This tool identifies:
+    - Prospects that went outbound (DIM_PROSPECT) but are not yet in SFMC (RAW_SFMC_PROSPECT_C)
+    - Prospects in SFMC but with no matching DIM_PROSPECT (data integrity issue)
+    - Matching prospects — confirming successful outbound → SFMC load
+    - SFMC engagement volume per active prospect (sent, opened, clicked)
+
+    Use this when the user asks:
+    - "Are all active prospects loaded into SFMC?"
+    - "How many prospects in DIM_PROSPECT are reflected in SFMC?"
+    - "Match outbound to SFMC prospect data"
+    - "Which prospects are in SFMC vs in DIM_PROSPECT?"
+    - "SFMC history vs inbound reconciliation"
+
+    Args:
+        limit: Max rows for the mismatch details (default 100).
+
+    Returns:
+        Reconciliation summary and per-status breakdown as markdown tables.
+    """
+    # Summary match/miss counts
+    match_sql = textwrap.dedent(f"""
+        WITH dim AS (
+            SELECT MASTER_PATIENT_ID, FIRST_NAME, LAST_NAME, EMAIL,
+                   PRIMARY_CHANNEL, FIRST_INTAKE_DATE
+            FROM FIPSAR_DW.GOLD.DIM_PROSPECT
+        ),
+        sfmc AS (
+            SELECT PROSPECT_ID, FIRST_NAME, LAST_NAME, EMAIL_ADDRESS,
+                   MARKETING_CONSENT, HIGH_ENGAGEMENT
+            FROM FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_C
+        )
+        SELECT
+            COUNT(DISTINCT d.MASTER_PATIENT_ID)               AS dim_prospect_total,
+            COUNT(DISTINCT s.PROSPECT_ID)                     AS sfmc_prospect_c_total,
+            COUNT(DISTINCT CASE WHEN s.PROSPECT_ID IS NOT NULL
+                           THEN d.MASTER_PATIENT_ID END)      AS matched_in_both,
+            COUNT(DISTINCT CASE WHEN s.PROSPECT_ID IS NULL
+                           THEN d.MASTER_PATIENT_ID END)      AS in_dim_not_sfmc,
+            COUNT(DISTINCT CASE WHEN d.MASTER_PATIENT_ID IS NULL
+                           THEN s.PROSPECT_ID END)            AS in_sfmc_not_dim
+        FROM dim d
+        FULL OUTER JOIN sfmc s ON d.MASTER_PATIENT_ID = s.PROSPECT_ID
+    """)
+    match_result = _run(match_sql, max_rows=5)
+
+    # Prospects in DIM but not yet in SFMC
+    missing_sql = textwrap.dedent(f"""
+        SELECT d.MASTER_PATIENT_ID, d.FIRST_NAME, d.LAST_NAME, d.EMAIL,
+               d.PRIMARY_CHANNEL, d.FIRST_INTAKE_DATE,
+               'In DIM_PROSPECT but NOT in SFMC (not yet exported or load failed)' AS status
+        FROM FIPSAR_DW.GOLD.DIM_PROSPECT d
+        LEFT JOIN FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_C s
+               ON d.MASTER_PATIENT_ID = s.PROSPECT_ID
+        WHERE s.PROSPECT_ID IS NULL
+        ORDER BY d.FIRST_INTAKE_DATE DESC
+        LIMIT {limit}
+    """)
+    missing_result = _run(missing_sql, max_rows=limit)
+
+    # Matched prospects with engagement summary
+    engaged_sql = textwrap.dedent(f"""
+        SELECT
+            d.MASTER_PATIENT_ID,
+            d.FIRST_NAME, d.LAST_NAME,
+            s.MARKETING_CONSENT,
+            s.HIGH_ENGAGEMENT,
+            COUNT(CASE WHEN fe.EVENT_TYPE='SENT'  THEN 1 END)  AS total_sends,
+            COUNT(CASE WHEN fe.EVENT_TYPE='OPEN'  THEN 1 END)  AS total_opens,
+            COUNT(CASE WHEN fe.EVENT_TYPE='CLICK' THEN 1 END)  AS total_clicks,
+            ROUND(COUNT(CASE WHEN fe.EVENT_TYPE='OPEN'  THEN 1 END)*100.0
+                  /NULLIF(COUNT(CASE WHEN fe.EVENT_TYPE='SENT' THEN 1 END),0),1) AS open_rate_pct,
+            MAX(fe.EVENT_TIMESTAMP) AS last_engagement
+        FROM FIPSAR_DW.GOLD.DIM_PROSPECT d
+        JOIN FIPSAR_SFMC_EVENTS.RAW_EVENTS.RAW_SFMC_PROSPECT_C s
+             ON d.MASTER_PATIENT_ID = s.PROSPECT_ID
+        LEFT JOIN FIPSAR_DW.GOLD.FACT_SFMC_ENGAGEMENT fe
+             ON fe.SUBSCRIBER_KEY = d.MASTER_PATIENT_ID
+        GROUP BY 1,2,3,4,5
+        ORDER BY total_sends DESC
+        LIMIT {limit}
+    """)
+    engaged_result = _run(engaged_sql, max_rows=limit)
+
+    return (
+        "### Outbound Reconciliation Summary (DIM_PROSPECT vs RAW_SFMC_PROSPECT_C)\n"
+        + match_result
+        + "\n\n### Prospects in DIM_PROSPECT but NOT yet in SFMC\n"
+        + missing_result
+        + "\n\n### Matched Prospects — Engagement Summary\n"
+        + engaged_result
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1275,6 +1574,8 @@ ALL_TOOLS = [
     get_pipeline_observability,
     get_rejected_lead_details,
     get_prospect_details,
+    get_sfmc_stage_suppression,
+    get_sfmc_prospect_outbound_match,
     chart_smart,
     chart_funnel,
     chart_rejections,
