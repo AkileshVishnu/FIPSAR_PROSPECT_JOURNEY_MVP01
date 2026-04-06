@@ -54,10 +54,14 @@ _checkpointer = MemorySaver()
 # Build the agent
 # ---------------------------------------------------------------------------
 
+import inspect as _inspect
+_react_params = _inspect.signature(create_react_agent).parameters
+_prompt_kwarg = "prompt" if "prompt" in _react_params else "state_modifier"
+
 _agent = create_react_agent(
     model=_llm,
     tools=ALL_TOOLS,
-    prompt=SYSTEM_PROMPT,
+    **{_prompt_kwarg: SYSTEM_PROMPT},
     checkpointer=_checkpointer,
 )
 
